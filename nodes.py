@@ -382,15 +382,20 @@ class LatentUpscaleKSampler:
             },
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("LATENT",)
+    RETURN_TYPES = ("LATENT", "CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("LATENT", "positive_hi", "negative_hi")
     FUNCTION = "sample"
     CATEGORY = "sampling/custom"
     DESCRIPTION = (
         "MiniMax H3 two-stage sampler: low-res sampling -> aspect-locked learned latent upscale -> "
         "conditioning sync -> short high-res refinement. Requires "
         "LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler. Set bypass_upscale=True to run only the "
-        "first phase (full-schedule low-res sample) and skip upscale + refine entirely."
+        "first phase (full-schedule low-res sample) and skip upscale + refine entirely. "
+        "positive_hi/negative_hi are the conditioning actually used for the (possibly upscaled) "
+        "output latent -- wire these into any downstream sampler (e.g. H3 Audio Refine Sampler) "
+        "that consumes this node's LATENT output, instead of the original positive/negative, or "
+        "MiniMax-H3's image/keyframe conditioning will still be sized for the pre-upscale "
+        "resolution and crash with a PackedLayout shape mismatch."
     )
 
     def sample(
@@ -432,7 +437,7 @@ class LatentUpscaleKSampler:
             pass1_only = _run_registered_node(
                 "SamplerCustomAdvanced", noise, guider_1, sampler, full_sigmas, latent_image
             )
-            return (pass1_only[0],)
+            return (pass1_only[0], positive, negative)
 
         if upscale_at_step >= total_steps:
             raise ValueError(
@@ -550,7 +555,7 @@ class LatentUpscaleKSampler:
             "SamplerCustomAdvanced", noise, guider_2, sampler, refine_sigma_tensor, upscaled_latent
         )
 
-        return (pass2[0],)
+        return (pass2[0], positive_hi, negative_hi)
 
 
 class AmountSlider:
