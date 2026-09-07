@@ -10,6 +10,7 @@ import comfy.clip_vision
 import nodes
 
 from . import minimax_progress_patch  # noqa: F401  (applies its patch on import)
+from comfy_extras.nodes_resolution import AspectRatio, ASPECT_RATIOS
 
 
 class AnyType(str):
@@ -611,6 +612,89 @@ class FloatFine:
         return (value,)
 
 
+class H3TileAwareResolutionSelector:
+    """
+    コアの Resolution Selector と同じ aspect_ratio/megapixels 指定から解像度を
+    計算するが、MiniMax-H3 Video VAE のタイル分割(既定 256px タイル・64px
+    オーバーラップ=192px刻み)を考慮し、幅・高さそれぞれを直近のタイル境界
+    (256 + 192×(n-1))のうち近い方にスナップする。境界をわずかに跨いだだけの
+    「タイル1枚分丸ごと余分に払って解像度はほぼ変わらない」ケースを回避しつつ、
+    境界に近い側では素直にそこまで使い切る。単純に切り上げ続けると小さい解像度
+    ではアスペクト比が大きく崩れるため(タイル1枚あたりの相対幅が大きいため)、
+    その対策として「近い方に丸める」方式にしている。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "aspect_ratio": ([e.value for e in AspectRatio], {
+                    "default": AspectRatio.SQUARE.value,
+                }),
+                "megapixels": ("FLOAT", {
+                    "default": 1.0, "min": 0.1, "max": 16.0, "step": 0.1,
+                }),
+                "multiple": ("INT", {
+                    "default": 32, "min": 8, "max": 128, "step": 4,
+                    "tooltip": "latentグリッド整列用。MiniMax-H3では32を推奨。",
+                }),
+            },
+            "optional": {
+                "tile_size": ("INT", {
+                    "default": 256, "min": 32, "max": 1024, "step": 32,
+                    "tooltip": "VAEのタイルサイズ(px)。MiniMax-H3の既定は256。",
+                }),
+                "tile_overlap": ("INT", {
+                    "default": 64, "min": 0, "max": 512, "step": 8,
+                    "tooltip": "VAEのタイルオーバーラップ(px)。MiniMax-H3の既定は64。",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("width", "height", "tiles_w", "tiles_h")
+    FUNCTION = "run"
+    CATEGORY = "utils"
+    DISPLAY_NAME = "Resolution Selector (H3 Tile-Aware)"
+
+    @staticmethod
+    def _tiles_for(size, tile_size, stride):
+        if size <= tile_size:
+            return 1
+        return 1 + math.ceil((size - tile_size) / stride)
+
+    @staticmethod
+    def _boundary(n_tiles, tile_size, stride):
+        return tile_size + stride * (n_tiles - 1)
+
+    @classmethod
+    def _snap_to_nearest_tile_boundary(cls, size, multiple, tile_size, stride):
+        n = cls._tiles_for(size, tile_size, stride)
+        if n <= 1:
+            # 1タイル以下は境界の概念がない(0〜tile_sizeまで同じコスト)。
+            # ここで無理に tile_size まで引き上げると小さい解像度ほど
+            # アスペクト比が大きく崩れるため、素のサイズをそのまま使う。
+            return size, n
+        upper = (cls._boundary(n, tile_size, stride) // multiple) * multiple
+        lower = (cls._boundary(n - 1, tile_size, stride) // multiple) * multiple
+        if abs(size - lower) <= abs(upper - size):
+            return lower, n - 1
+        return upper, n
+
+    def run(self, aspect_ratio, megapixels, multiple, tile_size=256, tile_overlap=64):
+        w_ratio, h_ratio = ASPECT_RATIOS[AspectRatio(aspect_ratio)]
+        total_pixels = megapixels * 1024 * 1024
+        scale = math.sqrt(total_pixels / (w_ratio * h_ratio))
+        width = round(w_ratio * scale / multiple) * multiple
+        height = round(h_ratio * scale / multiple) * multiple
+
+        stride = max(1, tile_size - tile_overlap)
+        width, tiles_w = self._snap_to_nearest_tile_boundary(width, multiple, tile_size, stride)
+        height, tiles_h = self._snap_to_nearest_tile_boundary(height, multiple, tile_size, stride)
+
+        return (int(width), int(height), int(tiles_w), int(tiles_h))
+
+
 class CLIPVisionLoaderDevice:
     @classmethod
     def INPUT_TYPES(cls):
@@ -822,6 +906,7 @@ NODE_CLASS_MAPPINGS = {
     "LatentUpscaleKSampler": LatentUpscaleKSampler,
     "AmountSlider": AmountSlider,
     "FloatFine": FloatFine,
+    "H3TileAwareResolutionSelector": H3TileAwareResolutionSelector,
     "CLIPVisionLoaderDevice": CLIPVisionLoaderDevice,
     "AudioDuration": AudioDuration,
     "VAEDecodeTiledProgress": VAEDecodeTiledProgress,
@@ -833,6 +918,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LatentUpscaleKSampler": "KSampler (Latent Upscale)",
     "AmountSlider": "Amount Slider",
     "FloatFine": "Float (0.1 step)",
+    "H3TileAwareResolutionSelector": "Resolution Selector (H3 Tile-Aware)",
     "CLIPVisionLoaderDevice": "Load CLIP Vision (Device)",
     "AudioDuration": "Audio Duration",
     "VAEDecodeTiledProgress": "VAE Decode Tiled (Progress) 🟢",
