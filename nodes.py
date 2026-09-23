@@ -14,6 +14,7 @@ import comfy.clip_vision
 import nodes
 
 from . import minimax_progress_patch  # noqa: F401  (applies its patch on import)
+from . import kitchen_cuda_enable  # noqa: F401  (re-enables comfy-kitchen CUDA backend under forward compat)
 from comfy_extras.nodes_resolution import AspectRatio, ASPECT_RATIOS
 
 
