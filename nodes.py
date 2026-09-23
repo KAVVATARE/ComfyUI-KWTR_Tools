@@ -3,6 +3,10 @@ from __future__ import annotations
 import datetime
 import gc
 import math
+import os
+import re
+import shutil
+import subprocess
 import torch
 import folder_paths
 import comfy.samplers
@@ -850,6 +854,342 @@ class VAEDecodeTiledProgress:
         return (images,)
 
 
+_ABC_LETTERS = ['C', 'D', 'E', 'F', 'G', 'A', 'B']  # octave boundary sits at B->C, not G->A
+_ABC_NATURAL_PITCH = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
+_ABC_SHARP_ORDER = ['F', 'C', 'G', 'D', 'A', 'E', 'B']
+_ABC_FLAT_ORDER = ['B', 'E', 'A', 'D', 'G', 'C', 'F']
+_ABC_ACC_SYMBOL = {2: '^^', 1: '^', 0: '=', -1: '_', -2: '__'}
+_ABC_ACC_VALUE = {'^^': 2, '^': 1, '=': 0, '_': -1, '__': -2}
+
+_ABC_MAJOR_KEY_POS = {
+    'Cb': -7, 'Gb': -6, 'Db': -5, 'Ab': -4, 'Eb': -3, 'Bb': -2, 'F': -1,
+    'C': 0, 'G': 1, 'D': 2, 'A': 3, 'E': 4, 'B': 5, 'F#': 6, 'C#': 7,
+}
+_ABC_MINOR_KEY_POS = {
+    'Ab': -7, 'Eb': -6, 'Bb': -5, 'F': -4, 'C': -3, 'G': -2, 'D': -1,
+    'A': 0, 'E': 1, 'B': 2, 'F#': 3, 'C#': 4, 'G#': 5, 'D#': 6, 'A#': 7,
+}
+_ABC_MAJOR_KEYS = ['C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#', 'F', 'Bb', 'Eb', 'Ab', 'Db', 'Gb', 'Cb']
+_ABC_MINOR_KEYS = ['Am', 'Em', 'Bm', 'F#m', 'C#m', 'G#m', 'D#m', 'A#m',
+                   'Dm', 'Gm', 'Cm', 'Fm', 'Bbm', 'Ebm', 'Abm']
+YUE2_ABC_TARGET_KEY_CHOICES = _ABC_MAJOR_KEYS + _ABC_MINOR_KEYS
+
+_ABC_TOKEN_RE = re.compile(r'"[^"]*"|(?:\^\^|__|\^|_|=)?[A-Ga-g][,\']*|\|+')
+_ABC_NOTE_TOKEN_RE = re.compile(r"^(\^\^|__|\^|_|=)?([A-Ga-g])([,']*)$")
+_ABC_CHORD_ROOT_RE = re.compile(r'^([A-G])([#b]{0,2})(.*)$')
+
+
+def _abc_parse_key(key_str):
+    key_str = key_str.strip()
+    m = re.fullmatch(r"([A-Ga-g])([#b]?)(m?)", key_str)
+    if not m:
+        raise ValueError(f"Unsupported/unparsed ABC key field: {key_str!r}")
+    letter_raw, acc, minor_suffix = m.groups()
+    letter = letter_raw.upper()
+    mode = "minor" if (minor_suffix or letter_raw.islower()) else "major"
+    table = _ABC_MINOR_KEY_POS if mode == "minor" else _ABC_MAJOR_KEY_POS
+    lookup = letter + acc
+    if lookup not in table:
+        raise ValueError(
+            f"Unsupported key for this node: {key_str!r} "
+            "(only standard major/minor keys up to 7 sharps/flats)"
+        )
+    pos = table[lookup]
+    acc_val = acc.count('#') - acc.count('b')
+    return letter, acc_val, mode, pos
+
+
+def _abc_key_signature(pos):
+    sig = {L: 0 for L in _ABC_LETTERS}
+    if pos > 0:
+        for L in _ABC_SHARP_ORDER[:pos]:
+            sig[L] = 1
+    elif pos < 0:
+        for L in _ABC_FLAT_ORDER[:-pos]:
+            sig[L] = -1
+    return sig
+
+
+def _abc_transposition_interval(old_letter, old_acc, new_letter, new_acc):
+    letter_shift_raw = (_ABC_LETTERS.index(new_letter) - _ABC_LETTERS.index(old_letter)) % 7
+    natural_diff = (_ABC_NATURAL_PITCH[new_letter] - _ABC_NATURAL_PITCH[old_letter]) % 12
+    s0 = (natural_diff + (new_acc - old_acc)) % 12
+    if s0 > 6:
+        return letter_shift_raw - 7, s0 - 12
+    return letter_shift_raw, s0
+
+
+def _abc_transpose_chord_symbol(text, letter_shift, semitone_shift):
+    inner = text[1:-1]
+    if not inner:
+        return text
+
+    def _transpose_root(part):
+        m = _ABC_CHORD_ROOT_RE.match(part)
+        if not m:
+            return part
+        letter, acc, suffix = m.groups()
+        acc_val = acc.count('#') - acc.count('b')
+        old_pitch = _ABC_NATURAL_PITCH[letter] + acc_val
+        new_letter = _ABC_LETTERS[(_ABC_LETTERS.index(letter) + letter_shift) % 7]
+        target_pitch = old_pitch + semitone_shift
+        d_new = target_pitch - _ABC_NATURAL_PITCH[new_letter]
+        d_new = ((d_new + 6) % 12) - 6  # fold into a chord symbol's -2..2 range
+        acc_new = {2: '##', 1: '#', 0: '', -1: 'b', -2: 'bb'}.get(d_new, '')
+        return new_letter + acc_new + suffix
+
+    if '/' in inner:
+        root_part, bass_part = inner.split('/', 1)
+        return f'"{_transpose_root(root_part)}/{_transpose_root(bass_part)}"'
+    return f'"{_transpose_root(inner)}"'
+
+
+class YuE2AbcKeyTempoFix:
+    """
+    YuE2 Generate ABC (in-graph LLM symbolic planner) treats the requested key
+    and tempo as generative hints, not hard constraints, so its output can
+    drift (e.g. asked for G major/130 BPM, got K:D / Q:1/4=133). Re-prompting
+    risks new notation errors in the bounded native ABC dialect (see this
+    project's yue2-music skill notes). This node instead deterministically
+    rewrites the already-generated score: a proper diatonic transposition
+    (every note shifted by the same scale-degree + semitone interval, with
+    accidentals re-spelled for the new key signature, tracked per-bar per-
+    voice) plus a straight Q: tempo rewrite. No further generative pass.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "abc": ("STRING", {"multiline": True, "default": ""}),
+                "target_key": (YUE2_ABC_TARGET_KEY_CHOICES, {"default": "G"}),
+                "target_bpm": ("INT", {"default": 130, "min": 20, "max": 400}),
+                "transpose_chord_symbols": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "INT")
+    RETURN_NAMES = ("abc", "detected_source_key", "semitone_shift")
+    FUNCTION = "run"
+    CATEGORY = "KWTR/music"
+    DESCRIPTION = (
+        "Deterministically transposes a generated YuE2/SheetSage2-style two-voice "
+        "(V: Vocal / V: Ins) ABC score to an exact target key and rewrites its Q: "
+        "tempo, instead of re-prompting the generator. Preserves each note's "
+        "scale-degree relationship and re-spells accidentals for the new key "
+        "signature; chord symbols are transposed too unless disabled."
+    )
+
+    def run(self, abc, target_key, target_bpm, transpose_chord_symbols):
+        out_lines = []
+
+        old_key = None
+        old_sig = None
+        new_letter_full, new_acc_val, new_mode, new_pos = _abc_parse_key(target_key)
+        new_sig = _abc_key_signature(new_pos)
+        letter_shift = semitone_shift = 0
+
+        voice_states_old = {}
+        voice_states_new = {}
+        current_voice = [None]  # mutable box so the nested closure sees live updates
+
+        def transpose_music_line(line):
+            def repl(m):
+                text = m.group(0)
+                if text.startswith('"'):
+                    if transpose_chord_symbols:
+                        return _abc_transpose_chord_symbol(text, letter_shift, semitone_shift)
+                    return text
+                if set(text) == {'|'}:
+                    voice_states_old[current_voice[0]] = {}
+                    voice_states_new[current_voice[0]] = {}
+                    return text
+
+                nm = _ABC_NOTE_TOKEN_RE.match(text)
+                acc_sym, letter, marks = nm.groups()
+                letter_upper = letter.upper()
+                apostrophes = marks.count("'")
+                commas = marks.count(',')
+                base_oct = 5 if letter.islower() else 4
+                oct_old = base_oct + apostrophes - commas
+
+                state_old = voice_states_old.setdefault(current_voice[0], {})
+                if acc_sym is not None:
+                    d_old = _ABC_ACC_VALUE[acc_sym]
+                    state_old[letter_upper] = d_old
+                else:
+                    d_old = state_old.get(letter_upper, old_sig.get(letter_upper, 0))
+
+                abs_pitch_old = oct_old * 12 + _ABC_NATURAL_PITCH[letter_upper] + d_old
+
+                old_idx = _ABC_LETTERS.index(letter_upper)
+                oct_delta, new_idx = divmod(old_idx + letter_shift, 7)
+                new_letter_upper = _ABC_LETTERS[new_idx]
+                new_oct = oct_old + oct_delta
+                required_pitch = abs_pitch_old + semitone_shift
+                d_new = required_pitch - (new_oct * 12 + _ABC_NATURAL_PITCH[new_letter_upper])
+
+                state_new = voice_states_new.setdefault(current_voice[0], {})
+                base_new = new_sig.get(new_letter_upper, 0)
+                active_new = state_new.get(new_letter_upper, base_new)
+                acc_out = ''
+                if active_new != d_new:
+                    acc_out = _ABC_ACC_SYMBOL.get(d_new, '')
+                    state_new[new_letter_upper] = d_new
+
+                if new_oct >= 5:
+                    out_letter = new_letter_upper.lower()
+                    out_marks = "'" * (new_oct - 5)
+                else:
+                    out_letter = new_letter_upper
+                    out_marks = ',' * max(0, 4 - new_oct)
+                return acc_out + out_letter + out_marks
+
+            return _ABC_TOKEN_RE.sub(repl, line)
+
+        for line in abc.splitlines():
+            stripped = line.strip()
+
+            if stripped.startswith('%'):
+                out_lines.append(line)
+                continue
+
+            header_match = re.match(r'^([A-Za-z]):(.*)$', stripped)
+            if header_match and header_match.group(1) in "XTMLQKV":
+                field = header_match.group(1)
+                rest = header_match.group(2)
+
+                if field == 'K':
+                    if old_key is None:
+                        old_letter, old_acc_val, old_mode, old_pos = _abc_parse_key(rest)
+                        old_key = rest.strip()
+                        old_sig = _abc_key_signature(old_pos)
+                        letter_shift, semitone_shift = _abc_transposition_interval(
+                            old_letter, old_acc_val, new_letter_full, new_acc_val,
+                        )
+                    out_lines.append(f"K:{target_key}")
+                    continue
+
+                if field == 'Q':
+                    new_q, n_subs = re.subn(r'=\s*\d+', f'={int(target_bpm)}', rest)
+                    if n_subs == 0:
+                        new_q = f"1/4={int(target_bpm)}"
+                    out_lines.append(f"Q:{new_q}")
+                    continue
+
+                if field == 'V':
+                    voice_tokens = rest.strip().split()
+                    if len(voice_tokens) == 1:
+                        current_voice[0] = voice_tokens[0]
+                    out_lines.append(line)
+                    continue
+
+                out_lines.append(line)  # X, T, M, L: unchanged
+                continue
+
+            if current_voice[0] is not None and old_sig is not None:
+                out_lines.append(transpose_music_line(line))
+            else:
+                out_lines.append(line)
+
+        if old_key is None:
+            raise ValueError(
+                "No K: field found in the supplied ABC; cannot determine the "
+                "source key to transpose from."
+            )
+
+        return ("\n".join(out_lines), old_key, int(semitone_shift))
+
+
+class YuE2AbcToMidi:
+    """
+    Wraps the abc2midi CLI (abcMIDI toolkit, apt package 'abcmidi', installed by
+    comfyui_start.sh) to render a two-voice YuE2/SheetSage2-style ABC score
+    straight to a standard multi-track MIDI file. Each V: voice lands on its
+    own MIDI track (not merged into one), matching a compliant ABC->MIDI
+    converter's normal behaviour.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "abc": ("STRING", {"multiline": True, "default": ""}),
+                "filename_prefix": ("STRING", {"default": "yue2/abc2midi"}),
+                "auto_chord_accompaniment": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Disable to inject %%MIDI gchordoff, so quoted "
+                               "chord symbols don't generate an extra backing track.",
+                }),
+                "also_save_abc": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Also save the exact .abc text next to the .mid.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("midi_path",)
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+    CATEGORY = "KWTR/music"
+    DISPLAY_NAME = "Save MIDI (abc2midi)"
+    DESCRIPTION = (
+        "Renders ABC text to a standard multi-track .mid via the abc2midi CLI. "
+        "Each V: voice becomes its own MIDI track."
+    )
+
+    def run(self, abc, filename_prefix, auto_chord_accompaniment, also_save_abc):
+        if shutil.which("abc2midi") is None:
+            raise RuntimeError(
+                "abc2midi not found on PATH. Install the 'abcmidi' apt package "
+                "(now automated in comfyui_start.sh -- restart ComfyUI via that "
+                "script, or run `apt-get install -y abcmidi` manually)."
+            )
+
+        output_dir = folder_paths.get_output_directory()
+        full_output_folder, filename, counter, _subfolder, _prefix = (
+            folder_paths.get_save_image_path(filename_prefix, output_dir)
+        )
+
+        abc_text = abc
+        if not auto_chord_accompaniment:
+            lines = abc_text.splitlines()
+            if lines:
+                lines.insert(1, "%%MIDI gchordoff")
+                abc_text = "\n".join(lines)
+            else:
+                abc_text = "%%MIDI gchordoff\n"
+
+        base_name = f"{filename}_{counter:05}_"
+        abc_path = os.path.join(full_output_folder, base_name + ".abc")
+        midi_path = os.path.join(full_output_folder, base_name + ".mid")
+
+        with open(abc_path, "w", encoding="utf-8") as f:
+            f.write(abc_text)
+
+        proc = subprocess.run(
+            ["abc2midi", abc_path, "-o", midi_path],
+            capture_output=True, text=True,
+        )
+        if proc.stdout:
+            print(f"[KWTR YuE2AbcToMidi] abc2midi stdout:\n{proc.stdout}")
+        if proc.stderr:
+            print(f"[KWTR YuE2AbcToMidi] abc2midi stderr:\n{proc.stderr}")
+
+        if not os.path.exists(midi_path):
+            raise RuntimeError(
+                "abc2midi did not produce a MIDI file.\n"
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+
+        if not also_save_abc:
+            os.remove(abc_path)
+
+        print(f"[KWTR YuE2AbcToMidi] wrote {midi_path}")
+        return (midi_path,)
+
+
 class MetaInfoFilenamePrefix:
     """
     trigger(VIDEO/IMAGE)到達時刻でタイムスタンプを確定し、
@@ -911,6 +1251,8 @@ NODE_CLASS_MAPPINGS = {
     "AudioDuration": AudioDuration,
     "VAEDecodeTiledProgress": VAEDecodeTiledProgress,
     "MetaInfoFilenamePrefix": MetaInfoFilenamePrefix,
+    "YuE2AbcKeyTempoFix": YuE2AbcKeyTempoFix,
+    "YuE2AbcToMidi": YuE2AbcToMidi,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -923,4 +1265,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AudioDuration": "Audio Duration",
     "VAEDecodeTiledProgress": "VAE Decode Tiled (Progress) 🟢",
     "MetaInfoFilenamePrefix": "prompt + filename_prefix output",
+    "YuE2AbcKeyTempoFix": "YuE2 ABC Key/Tempo Fix",
+    "YuE2AbcToMidi": "Save MIDI (abc2midi)",
 }
