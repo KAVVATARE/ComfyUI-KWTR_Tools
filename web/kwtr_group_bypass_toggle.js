@@ -11,6 +11,21 @@ function getGroupTitles(graph) {
     return groups.map((g) => g.title).filter(Boolean);
 }
 
+// This node is frontend-only (isVirtualNode) and never runs on the backend,
+// so a connected "switch" input can't be fed through normal prompt
+// execution. Instead, read the upstream node's current widget value directly
+// off the graph on every frame - this works for simple constant-value nodes
+// like the core "Boolean" node, whose widget value IS its output.
+function readBooleanFromInput(node, inputIndex) {
+    const link = node.inputs?.[inputIndex]?.link;
+    if (link == null) return null;
+    const graph = node.graph || app.graph;
+    const linkInfo = graph?.links?.[link];
+    const originNode = linkInfo && graph.getNodeById(linkInfo.origin_id);
+    const widget = originNode?.widgets?.find((w) => w.name === "value") ?? originNode?.widgets?.[0];
+    return widget ? Boolean(widget.value) : null;
+}
+
 function applyBypassToGroup(graph, groupTitle, enabled) {
     if (!graph || !groupTitle) return;
     const groups = graph._groups || graph.groups || [];
@@ -40,6 +55,8 @@ app.registerExtension({
                 this.isVirtualNode = true;
                 this.serialize_widgets = true;
 
+                this.addInput("switch", "BOOLEAN");
+
                 this.onFalseWidget = this.addWidget(
                     "combo",
                     "on_false",
@@ -67,12 +84,37 @@ app.registerExtension({
 
             // Keep the two combo dropdowns showing the workflow's current
             // group titles (groups can be added/renamed/removed at any time).
+            // Also, if a BOOLEAN is connected to the "switch" input, let it
+            // drive the switch widget instead of manual clicks.
             onDrawForeground(ctx) {
                 const graph = this.graph || app.graph;
                 const titles = getGroupTitles(graph);
                 const list = titles.length ? titles : [""];
                 this.onFalseWidget.options.values = list;
                 this.onTrueWidget.options.values = list;
+
+                const linked = readBooleanFromInput(this, 0);
+                const isLinked = linked !== null;
+                if (isLinked !== this._switchWidgetHidden) {
+                    this._switchWidgetHidden = isLinked;
+                    if (isLinked) {
+                        // Collapse the toggle's row to 0 height and skip its
+                        // draw call, same trick ComfyUI itself uses for a
+                        // widget that's been converted to an input - so once
+                        // connected, only the "switch" input dot is visible.
+                        this.switchWidget.draw = () => {};
+                        this.switchWidget.computeSize = () => [0, -4];
+                    } else {
+                        delete this.switchWidget.draw;
+                        delete this.switchWidget.computeSize;
+                    }
+                    this.size = this.computeSize();
+                }
+                if (isLinked && linked !== this.switchWidget.value) {
+                    this.switchWidget.value = linked;
+                    this.applyState(linked);
+                }
+
                 return LGraphNode.prototype.onDrawForeground?.apply(this, arguments);
             }
 
