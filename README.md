@@ -38,10 +38,14 @@ VIDEO/IMAGE などの `trigger` が到達した時刻でタイムスタンプを
 ### Float (0.1 step) — `FloatFine`
 0.1刻みで細かく調整できる FLOAT 入力ノードです。
 
+### KWTR H3 Picture Reference Edit — `KWTR_H3PictureReferenceEdit`
+[MiniMax H3 Image Studio](https://github.com/astropuzzo/ComfyUI-MiniMax-H3-Image-Studio) の Reference Edit（REF2VA 静止画編集）のラッパーです。画像ソケットが `<Picture 1>`〜`<Picture 9>` と表示され、プロンプト上の呼び名とそのまま一致します。上流は未接続ソケットを飛ばして番号を詰めるため、飛び番号の接続・未接続の `<Picture N>` への言及・プロンプト内のソケット名（`reference_image_2` 等）は実行前にエラーにします。`<picture_1>` や `picture_1` などの表記揺れは `<Picture 1>` に自動で正規化します。
+
 ## 依存関係
 
 - ComfyUI 本体（`comfy.samplers` / `comfy.clip_vision` / `comfy.utils` などを利用）
 - `LatentUpscaleKSampler` を使う場合は [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) の導入が必要です
+- `KWTR H3 Picture Reference Edit` を使う場合は [ComfyUI-MiniMax-H3-Image-Studio](https://github.com/astropuzzo/ComfyUI-MiniMax-H3-Image-Studio) の導入が必要です
 - `minimax_progress_patch.py` は MiniMax-H3 系ノード（`comfy/ldm/minimax/vae.py`）が存在する環境を前提にしています。無い環境では何もせずスキップされます
 
 ## ライセンス
