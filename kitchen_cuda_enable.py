@@ -82,4 +82,45 @@ def _enable_kitchen_cuda():
                  f"(sol_attn available: {ck.sol_attn_is_available(torch.device('cuda'))})")
 
 
+def _guard_flash_decode_gqa():
+    """Fall back to torch when the flash decode GQA kernel rejects size-1 dims.
+
+    torch 2.8's DLPack export rewrites the stride of every size-1 dim to 1, and
+    comfy-kitchen 0.2.40's flash_attention_decode_gqa then raises "Unsupported
+    Flash Attention tensor strides" for any batch-1 or single-token query, i.e.
+    every Qwen3.5 decode step (MOSS-Image prompt upsampler / TextGenerate).
+    flash_attention_decode_gqa and flash_attention_decode_tree_merge look up
+    flash_attention_decode_gqa_is_available at call time and compute the same
+    result in torch when it is False, so we report False if a batch-1 / S=1
+    smoke call fails. Opt out with KWTR_FLASH_DECODE_GUARD=0.
+    """
+    if os.environ.get("KWTR_FLASH_DECODE_GUARD", "1") == "0":
+        return
+    try:
+        import comfy_kitchen.flash_attention as fa
+    except Exception:
+        return
+    if not torch.cuda.is_available():
+        return
+    dev = torch.device("cuda")
+    try:
+        if not fa.flash_attention_decode_gqa_is_available(dev, torch.bfloat16):
+            return
+    except Exception:
+        return
+    try:
+        q = torch.randn(1, 4, 1, 256, device=dev, dtype=torch.bfloat16)
+        k = torch.randn(1, 1, 64, 256, device=dev, dtype=torch.bfloat16)
+        lengths = torch.full((1,), 16, device=dev, dtype=torch.int32)
+        fa.flash_attention_decode_gqa(q, k, torch.randn_like(k), lengths)
+        torch.cuda.synchronize()
+        return  # kernel works with size-1 dims, keep it
+    except Exception as e:
+        err = e
+    fa.flash_attention_decode_gqa_is_available = lambda device=None, dtype=torch.bfloat16: False
+    logging.warning(f"{_TAG} flash_attention_decode_gqa failed on batch-1/single-token input ({err}); "
+                    f"using comfy-kitchen's torch fallback for GQA decode")
+
+
 _enable_kitchen_cuda()
+_guard_flash_decode_gqa()
